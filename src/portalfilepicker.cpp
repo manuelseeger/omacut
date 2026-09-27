@@ -180,7 +180,12 @@ void PortalFilePicker::openVideo() {
 }
 
 void PortalFilePicker::exportVideo(const QUrl &suggestedUrl, double start, double end,
-                                   const QList<int> &scaleHeights) {
+                                   const QList<int> &scaleHeights, ffmpeg::ExportSettings settings) {
+    if (m_pendingAction != Action::None)
+        return;
+    m_pendingExportStart = start;
+    m_pendingExportEnd = end;
+    m_pendingSettings = settings;
     const QFileInfo target(suggestedUrl.toLocalFile());
 
     QVariantMap options;
@@ -193,7 +198,7 @@ void PortalFilePicker::exportVideo(const QUrl &suggestedUrl, double start, doubl
 
     // A "Quality" combo in the save dialog, only when there's a real downscale
     // to offer — sources at or below 720p just export as they are.
-    if (!scaleHeights.isEmpty()) {
+    if (std::holds_alternative<ffmpeg::EncodeSettings>(settings) && !scaleHeights.isEmpty()) {
         PortalChoiceOptions qualities = {{QStringLiteral("original"), QStringLiteral("Original")}};
         for (const int height : scaleHeights)
             qualities.append({QString::number(height), QStringLiteral("%1p").arg(height)});
@@ -204,11 +209,8 @@ void PortalFilePicker::exportVideo(const QUrl &suggestedUrl, double start, doubl
                                                           QStringLiteral("original")}}));
     }
 
-    if (requestFile(QStringLiteral("SaveFile"), QStringLiteral("Save Video File"),
-                    options, Action::Export)) {
-        m_pendingExportStart = start;
-        m_pendingExportEnd = end;
-    }
+    requestFile(QStringLiteral("SaveFile"), QStringLiteral("Save Video File"),
+                options, Action::Export);
 }
 
 bool PortalFilePicker::connectToRequestPath(const QString &path) {
@@ -290,6 +292,7 @@ void PortalFilePicker::handleResponse(uint response, const QVariantMap &results)
     const Action action = m_pendingAction;
     const double start = m_pendingExportStart;
     const double end = m_pendingExportEnd;
+    const ffmpeg::ExportSettings settings = m_pendingSettings;
     clearPending();
 
     if (response != 0)
@@ -306,6 +309,11 @@ void PortalFilePicker::handleResponse(uint response, const QVariantMap &results)
     }
     if (action != Action::Export)
         return;
+
+    if (std::holds_alternative<ffmpeg::StreamCopySettings>(settings)) {
+        emit exportSelected(url, start, end, settings);
+        return;
+    }
 
     // The chosen quality rides along in the response: [("quality", "1080")],
     // with "original" (or no choices at all) meaning no downscale.
@@ -325,7 +333,7 @@ void PortalFilePicker::handleResponse(uint response, const QVariantMap &results)
         }
         arg.endArray();
     }
-    emit exportSelected(url, start, end, scaleHeight);
+    emit exportSelected(url, start, end, ffmpeg::EncodeSettings{scaleHeight});
 }
 
 void PortalFilePicker::clearPending() {

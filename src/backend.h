@@ -24,6 +24,8 @@ class Backend : public QObject {
     Q_PROPERTY(int thumbReadyCount READ thumbReadyCount NOTIFY thumbsChanged)
     Q_PROPERTY(int thumbRevision READ thumbRevision NOTIFY thumbsChanged)
     Q_PROPERTY(bool busy READ busy NOTIFY busyChanged)
+    Q_PROPERTY(bool streamCopyAvailable READ streamCopyAvailable NOTIFY infoChanged)
+    Q_PROPERTY(QString streamCopyReason READ streamCopyReason NOTIFY infoChanged)
     Q_PROPERTY(QString status READ status NOTIFY statusChanged)
     Q_PROPERTY(QString themeAccent READ themeAccent NOTIFY themeAccentChanged)
     Q_PROPERTY(QString themeAccentForeground READ themeAccentForeground NOTIFY themeAccentChanged)
@@ -40,6 +42,8 @@ public:
     int thumbReadyCount() const { return m_thumbReadyCount; }
     int thumbRevision() const { return m_thumbRevision; }
     bool busy() const { return m_busy; }
+    bool streamCopyAvailable() const { return m_info.ok && m_info.copyUnavailableReason.isEmpty(); }
+    QString streamCopyReason() const { return m_info.copyUnavailableReason; }
     QString status() const { return m_status; }
     QString themeAccent() const { return m_themeAccent; }
     QString themeAccentForeground() const;
@@ -56,15 +60,13 @@ public:
 
     // Open native desktop file dialogs.
     Q_INVOKABLE void openVideoDialog();
-    Q_INVOKABLE void exportDialog(double start, double end);
+    Q_INVOKABLE void exportDialog(double start, double end, int mode = 0);
 
     // Suggested "<name>_trimmed.mp4" target next to the source.
     Q_INVOKABLE QUrl suggestedExportUrl() const;
 
-    // Write [start, end] (seconds) of the loaded video to dst. A non-zero
-    // scaleHeight downscales the shorter side to that size.
-    Q_INVOKABLE void exportClip(const QUrl &dst, double start, double end,
-                                int scaleHeight = 0);
+    void exportClip(const QUrl &dst, double start, double end,
+                    ffmpeg::ExportSettings settings = ffmpeg::EncodeSettings{});
 
     // The downscale heights worth offering for a source: only ones strictly
     // below the source's shorter side, so exports never upscale.
@@ -101,6 +103,7 @@ private:
     ffmpeg::VideoInfo m_info;
     QString m_path;
     QUrl m_source;
+    QUrl m_exportDialogSource;
     double m_thumbStart = 0.0;
     double m_thumbLen = 0.0;
     QVector<QImage> m_fullThumbs;

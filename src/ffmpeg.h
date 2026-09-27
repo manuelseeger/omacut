@@ -1,8 +1,11 @@
 #pragma once
 
+#include <QByteArray>
 #include <QImage>
+#include <QMetaType>
 #include <QString>
 #include <QStringList>
+#include <variant>
 
 #include <atomic>
 
@@ -12,8 +15,14 @@ namespace ffmpeg {
 struct VideoInfo {
     QString path;
     double duration = 0.0;  // seconds
+    double containerStartSeconds = 0.0;
     int width = 0;
     int height = 0;
+    int videoStream = -1;
+    int audioStream = -1;
+    QString videoCodec;
+    QString audioCodec;
+    QString copyUnavailableReason;
     bool ok = false;
     QString error;
 };
@@ -27,14 +36,20 @@ VideoInfo probe(const QString &path);
 QImage thumbnail(const QString &path, double time, int height = 90,
                  const std::atomic<bool> *cancel = nullptr);
 
+struct EncodeSettings { int scaleHeight = 0; };
+struct StreamCopySettings { int videoStream; int audioStream; };
+using ExportSettings = std::variant<EncodeSettings, StreamCopySettings>;
+
 // Build the ffmpeg argument list that writes [start, end] of src to dst.
-// Cuts are frame-accurate and re-encoded with libx264/aac. A non-zero
-// scaleHeight downscales so the shorter side becomes scaleHeight (1080p of a
-// portrait video is 1080 wide), always preserving the aspect ratio.
 QStringList trimArgs(const QString &src, const QString &dst, double start, double end,
-                     int scaleHeight = 0);
+                     const ExportSettings &settings = EncodeSettings{});
+
+bool nearestKeyframe(const QByteArray &line, double start, double end,
+                     double startTime, double *resolved);
 
 // Locate a tool on PATH; returns empty string if missing.
 QString toolPath(const QString &tool);
 
 }  // namespace ffmpeg
+
+Q_DECLARE_METATYPE(ffmpeg::ExportSettings)

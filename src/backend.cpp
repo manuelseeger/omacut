@@ -5,6 +5,8 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QProcess>
+#include <QTimer>
+#include <cmath>
 #include <QTextStream>
 
 #include <cstdio>
@@ -76,7 +78,13 @@ Backend::~Backend() {
 
 void Backend::wireFilePicker() {
     connect(m_filePicker, &FilePicker::openSelected, this, &Backend::load);
-    connect(m_filePicker, &FilePicker::exportSelected, this, &Backend::exportClip);
+    connect(m_filePicker, &FilePicker::exportSelected, this,
+            [this](const QUrl &url, double start, double end, ffmpeg::ExportSettings settings) {
+                const QUrl dialogSource = m_exportDialogSource;
+                m_exportDialogSource = {};
+                if (!dialogSource.isEmpty() && dialogSource == m_source)
+                    exportClip(url, start, end, settings);
+            });
     connect(m_filePicker, &FilePicker::failed, this, &Backend::loadError);
 }
 
@@ -164,6 +172,7 @@ bool Backend::load(const QUrl &url) {
         return false;
     }
 
+    m_exportDialogSource = {};
     m_info = info;
     m_path = path;
     m_source = url;
@@ -193,12 +202,23 @@ void Backend::openVideoDialog() {
     m_filePicker->openVideo();
 }
 
-void Backend::exportDialog(double start, double end) {
+void Backend::exportDialog(double start, double end, int mode) {
     if (m_path.isEmpty() || !m_info.ok)
         return;
-
+    if (mode != 0 && mode != 1) {
+        emit exportFailed(QStringLiteral("Unknown export mode."));
+        return;
+    }
+    if (mode == 1 && !streamCopyAvailable()) {
+        emit exportFailed(streamCopyReason());
+        return;
+    }
+    const ffmpeg::ExportSettings settings = mode == 1
+        ? ffmpeg::ExportSettings(ffmpeg::StreamCopySettings{m_info.videoStream, m_info.audioStream})
+        : ffmpeg::ExportSettings(ffmpeg::EncodeSettings{});
+    m_exportDialogSource = m_source;
     m_filePicker->exportVideo(suggestedExportUrl(), start, end,
-                              exportHeights(m_info.width, m_info.height));
+                              exportHeights(m_info.width, m_info.height), settings);
 }
 
 QList<int> Backend::exportHeights(int width, int height) {
@@ -314,13 +334,27 @@ QUrl Backend::suggestedExportUrl() const {
     return QUrl::fromLocalFile(target);
 }
 
-void Backend::exportClip(const QUrl &dst, double start, double end, int scaleHeight) {
+void Backend::exportClip(const QUrl &dst, double start, double end,
+                         ffmpeg::ExportSettings settings) {
     if (m_path.isEmpty() || !m_info.ok || m_busy)
         return;
 
-    if (end - start <= 0.0) {
+    if (!std::isfinite(start) || !std::isfinite(end) || start < 0 || end > m_info.duration + 0.01 || end <= start) {
         emit exportFailed("The selected clip has no length.");
         return;
+    }
+
+    const bool copy = std::holds_alternative<ffmpeg::StreamCopySettings>(settings);
+    if (copy && !streamCopyAvailable()) {
+        emit exportFailed(streamCopyReason());
+        return;
+    }
+    if (copy) {
+        const auto streams = std::get<ffmpeg::StreamCopySettings>(settings);
+        if (streams.videoStream != m_info.videoStream || streams.audioStream != m_info.audioStream) {
+            emit exportFailed(QStringLiteral("Selected streams do not match the loaded video."));
+            return;
+        }
     }
 
     // Forcing the .mp4 suffix can redirect the write to a file the save
@@ -341,20 +375,22 @@ void Backend::exportClip(const QUrl &dst, double start, double end, int scaleHei
     }
 
     setBusy(true);
-    setStatus(QStringLiteral("Exporting 0%"));
+    setStatus(copy ? QStringLiteral("Finding nearest keyframe...")
+                   : QStringLiteral("Exporting 0%"));
 
-    // Encode to a sibling temp file and atomically replace the target only after
-    // success, so failed/cancelled exports preserve any existing file.
     const QString tmpPath = outPath + QStringLiteral(".omacut-part.mp4");
     QFile::remove(tmpPath);
-    const QStringList args = ffmpeg::trimArgs(m_path, tmpPath, start, end, scaleHeight);
+    const QString sourcePath = m_path;
+    auto runExport = [this, sourcePath, outPath, tmpPath, end, ffmpegBin, settings](double resolvedStart) {
+    const QStringList args = ffmpeg::trimArgs(sourcePath, tmpPath, resolvedStart, end, settings);
+    setStatus(QStringLiteral("Exporting 0%"));
 
     auto *proc = new QProcess(this);
     auto completed = std::make_shared<bool>(false);
 
     // ffmpeg -progress writes key=value blocks to stdout as it encodes;
     // out_time_us against the clip length gives the percentage.
-    const double clipLen = end - start;
+    const double clipLen = end - resolvedStart;
     auto progressBuf = std::make_shared<QByteArray>();
     connect(proc, &QProcess::readyReadStandardOutput, this,
             [this, proc, progressBuf, clipLen, completed] {
@@ -403,6 +439,76 @@ void Backend::exportClip(const QUrl &dst, double start, double end, int scaleHei
                 failExport(tmpPath, err.isEmpty() ? QStringLiteral("Could not start ffmpeg.") : err);
             });
     proc->start(ffmpegBin, args);
+    };
+
+    if (!copy) {
+        runExport(start);
+        return;
+    }
+
+    const QString ffprobeBin = ffmpeg::toolPath(QStringLiteral("ffprobe"));
+    if (ffprobeBin.isEmpty()) {
+        failExport(tmpPath, QStringLiteral("`ffprobe` was not found on your PATH."));
+        return;
+    }
+    auto *probe = new QProcess(this);
+    auto probeCompleted = std::make_shared<bool>(false);
+    auto packetBuf = std::make_shared<QByteArray>();
+    auto nearest = std::make_shared<double>(-1.0);
+    const double startTime = m_info.containerStartSeconds;
+    const auto consumePackets = [probe, packetBuf, nearest, start, end, startTime] {
+        packetBuf->append(probe->readAllStandardOutput());
+        int newline;
+        while ((newline = packetBuf->indexOf('\n')) >= 0) {
+            ffmpeg::nearestKeyframe(packetBuf->left(newline), start, end, startTime, nearest.get());
+            packetBuf->remove(0, newline + 1);
+        }
+    };
+    connect(probe, &QProcess::readyReadStandardOutput, this, consumePackets);
+    auto *timeout = new QTimer(probe);
+    timeout->setSingleShot(true);
+    auto timedOut = std::make_shared<bool>(false);
+    connect(timeout, &QTimer::timeout, probe, [probe, timedOut] {
+        *timedOut = true;
+        probe->kill();
+    });
+    connect(probe, &QProcess::finished, this,
+            [this, probe, timeout, tmpPath, packetBuf, nearest, start, end, startTime, timedOut, consumePackets, runExport, probeCompleted](int code, QProcess::ExitStatus status) {
+                if (*probeCompleted)
+                    return;
+                *probeCompleted = true;
+                timeout->stop();
+                consumePackets();
+                if (!packetBuf->isEmpty())
+                    ffmpeg::nearestKeyframe(*packetBuf, start, end, startTime, nearest.get());
+                const QString error = QString::fromUtf8(probe->readAllStandardError()).trimmed();
+                probe->deleteLater();
+                if (*timedOut) {
+                    failExport(tmpPath, QStringLiteral("ffprobe timed out finding a keyframe."));
+                    return;
+                }
+                if (status != QProcess::NormalExit || code != 0 || *nearest < 0) {
+                    failExport(tmpPath, error.isEmpty()
+                        ? QStringLiteral("Could not find a keyframe before the trim end.") : error);
+                    return;
+                }
+                runExport(*nearest);
+            });
+    connect(probe, &QProcess::errorOccurred, this,
+            [this, probe, timeout, tmpPath, probeCompleted](QProcess::ProcessError error) {
+                if (error != QProcess::FailedToStart || *probeCompleted)
+                    return;
+                *probeCompleted = true;
+                timeout->stop();
+                probe->deleteLater();
+                failExport(tmpPath, QStringLiteral("Could not start ffprobe."));
+            });
+    probe->start(ffprobeBin, {QStringLiteral("-v"), QStringLiteral("error"),
+                              QStringLiteral("-select_streams"), QStringLiteral("v:0"),
+                              QStringLiteral("-show_packets"), QStringLiteral("-show_entries"),
+                              QStringLiteral("packet=pts_time,flags"), QStringLiteral("-of"),
+                              QStringLiteral("csv=p=0"), sourcePath});
+    timeout->start(120000);
 }
 
 void Backend::failExport(const QString &tmpPath, const QString &message) {

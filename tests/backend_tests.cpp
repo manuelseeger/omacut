@@ -29,12 +29,14 @@ public:
     double lastStart = 0;
     double lastEnd = 0;
     QList<int> lastScaleHeights;
+    ffmpeg::ExportSettings lastSettings = ffmpeg::EncodeSettings{};
 
     void openVideo() override { ++openCount; }
 
     void exportVideo(const QUrl &suggestedUrl, double start, double end,
-                     const QList<int> &scaleHeights) override {
+                     const QList<int> &scaleHeights, ffmpeg::ExportSettings settings) override {
         ++exportCount;
+        lastSettings = settings;
         lastSuggestedUrl = suggestedUrl;
         lastStart = start;
         lastEnd = end;
@@ -68,6 +70,8 @@ class ShortcutBackend : public QObject {
     Q_PROPERTY(int thumbReadyCount READ thumbReadyCount NOTIFY thumbsChanged)
     Q_PROPERTY(int thumbRevision READ thumbRevision NOTIFY thumbsChanged)
     Q_PROPERTY(bool busy READ busy NOTIFY busyChanged)
+    Q_PROPERTY(bool streamCopyAvailable READ streamCopyAvailable NOTIFY infoChanged)
+    Q_PROPERTY(QString streamCopyReason READ streamCopyReason NOTIFY infoChanged)
     Q_PROPERTY(QString status READ status NOTIFY statusChanged)
     Q_PROPERTY(QString themeAccent READ themeAccent NOTIFY themeAccentChanged)
     Q_PROPERTY(QString themeAccentForeground READ themeAccentForeground NOTIFY themeAccentChanged)
@@ -82,13 +86,17 @@ public:
     int thumbReadyCount() const { return 0; }
     int thumbRevision() const { return 0; }
     bool busy() const { return false; }
+    bool streamCopyAvailable() const { return m_copyAvailable; }
+    QString streamCopyReason() const { return m_copyAvailable ? QString() : QStringLiteral("Stream Copy needs H.264 video for MP4."); }
+    void setCopyAvailable(bool available) { m_copyAvailable = available; emit infoChanged(); }
     QString status() const { return {}; }
     QString themeAccent() const { return QStringLiteral("#FFD60A"); }
     QString themeAccentForeground() const { return QStringLiteral("black"); }
 
     Q_INVOKABLE bool load(const QUrl &) { return false; }
     Q_INVOKABLE void openVideoDialog() { ++openCount; }
-    Q_INVOKABLE void exportDialog(double start, double end) {
+    Q_INVOKABLE void exportDialog(double start, double end, int mode = 0) {
+        lastMode = mode;
         ++exportCount;
         lastStart = start;
         lastEnd = end;
@@ -106,6 +114,7 @@ public:
 
     int openCount = 0;
     int exportCount = 0;
+    int lastMode = 0;
     double lastStart = 0;
     double lastEnd = 0;
     int thumbRequestCount = 0;
@@ -125,6 +134,7 @@ signals:
 private:
     QUrl m_source;
     double m_duration;
+    bool m_copyAvailable = false;
 };
 
 // Finds a DialogButton by its label ("primary" tells them apart from Labels).
@@ -181,8 +191,13 @@ private slots:
     void thumbProviderScalesHeightOnlyRequests();
     void thumbnailWorkerStopsBlockedJobs();
     void exportDialogDelegatesSuggestedUrlAndRange();
+    void exportDialogPassesCopySettingsAndRejectsStaleResponse();
     void suggestedExportUrlAlwaysUsesMp4();
     void exportClipWritesMp4();
+    void streamCopyKeepsCodecAndNearestKeyframe();
+    void incompatibleStreamCopyIsRejected();
+    void failedKeyframeProbePreservesDestination();
+    void qmlDisablesIncompatibleStreamCopy();
     void exportClipCanReplaceSourceFile();
     void exportZeroLengthClipFails();
     void exportRefusesRewrittenPathOverExistingFile();
@@ -397,6 +412,43 @@ void BackendTests::exportDialogDelegatesSuggestedUrlAndRange() {
              QUrl::fromLocalFile(m_dir.filePath(QStringLiteral("clip_trimmed.mp4"))));
     QCOMPARE(picker->lastStart, 0.25);
     QCOMPARE(picker->lastEnd, 0.75);
+    QVERIFY(std::holds_alternative<ffmpeg::EncodeSettings>(picker->lastSettings));
+}
+
+void BackendTests::exportDialogPassesCopySettingsAndRejectsStaleResponse() {
+    ThumbProvider provider;
+    auto *picker = new FakeFilePicker;
+    Backend backend(&provider, picker);
+    QVERIFY(backend.load(videoUrl()));
+    const auto first = ffmpeg::probe(m_videoPath);
+    QVERIFY(backend.streamCopyAvailable());
+
+    backend.exportDialog(0.25, 0.75, 1);
+    QCOMPARE(picker->exportCount, 1);
+    QCOMPARE(picker->lastSuggestedUrl,
+             QUrl::fromLocalFile(m_dir.filePath(QStringLiteral("clip_trimmed.mp4"))));
+    QCOMPARE(picker->lastStart, 0.25);
+    QCOMPARE(picker->lastEnd, 0.75);
+    QVERIFY(std::holds_alternative<ffmpeg::StreamCopySettings>(picker->lastSettings));
+    const auto streams = std::get<ffmpeg::StreamCopySettings>(picker->lastSettings);
+    QCOMPARE(streams.videoStream, first.videoStream);
+    QCOMPARE(streams.audioStream, first.audioStream);
+
+    const QString otherPath = m_dir.filePath(QStringLiteral("other-source.mp4"));
+    QVERIFY(QFile::copy(m_videoPath, otherPath));
+    QVERIFY(backend.load(QUrl::fromLocalFile(otherPath)));
+    const auto second = ffmpeg::probe(otherPath);
+    QCOMPARE(second.videoStream, first.videoStream);
+    QCOMPARE(second.audioStream, first.audioStream);
+    QSignalSpy done(&backend, &Backend::exportDone);
+    QSignalSpy failed(&backend, &Backend::exportFailed);
+    const QString target = m_dir.filePath(QStringLiteral("stale-export.mp4"));
+    emit picker->exportSelected(QUrl::fromLocalFile(target), 0.25, 0.75, streams);
+    QVERIFY(!backend.busy());
+    QCOMPARE(done.count(), 0);
+    QCOMPARE(failed.count(), 0);
+    QVERIFY(!QFileInfo::exists(target));
+    waitForBackgroundWork(backend);
 }
 
 void BackendTests::suggestedExportUrlAlwaysUsesMp4() {
@@ -449,6 +501,209 @@ void BackendTests::exportClipWritesMp4() {
     QVERIFY(ffmpeg::probe(mp4Path).ok);
     QVERIFY2(formatName(mp4Path).contains(QStringLiteral("mp4")),
              qPrintable(formatName(mp4Path)));
+}
+
+void BackendTests::streamCopyKeepsCodecAndNearestKeyframe() {
+    double nearest = -1;
+    QVERIFY(ffmpeg::nearestKeyframe("0.000000,K_", 1.6, 3.5, 0, &nearest));
+    QVERIFY(ffmpeg::nearestKeyframe("2.000000,K_", 1.6, 3.5, 0, &nearest));
+    QCOMPARE(nearest, 2.0);
+    nearest = -1;
+    QVERIFY(ffmpeg::nearestKeyframe("0.000000,K_", 0.4, 3.5, 0, &nearest));
+    QVERIFY(ffmpeg::nearestKeyframe("2.000000,K_", 0.4, 3.5, 0, &nearest));
+    QCOMPARE(nearest, 0.0);
+    nearest = -1;
+    QVERIFY(!ffmpeg::nearestKeyframe("4.000000,K_", 2.0, 3.5, 0, &nearest));
+    QVERIFY(ffmpeg::nearestKeyframe("5.000000,K_", 0.4, 3.5, 5.0, &nearest));
+    QCOMPARE(nearest, 0.0);
+    QVERIFY(ffmpeg::nearestKeyframe("7.000000,K_", 1.6, 3.5, 5.0, &nearest));
+    QCOMPARE(nearest, 2.0);
+    nearest = -1;
+    QVERIFY(!ffmpeg::nearestKeyframe("N/A,K_", 0.4, 3.5, 5.0, &nearest));
+    QVERIFY(ffmpeg::nearestKeyframe("5.000000,K_", 0.4, 3.5, 5.0, &nearest));
+    QCOMPARE(nearest, 0.0);
+    const auto copyArgs = ffmpeg::trimArgs(QStringLiteral("input.mp4"),
+                                           QStringLiteral("output.mp4"), 2.0, 3.5,
+                                           ffmpeg::StreamCopySettings{0, 1});
+    QVERIFY(copyArgs.contains(QStringLiteral("copy")));
+    QCOMPARE(copyArgs.count(QStringLiteral("-map")), 2);
+    QVERIFY(!copyArgs.contains(QStringLiteral("-vf")));
+
+    const QString source = m_dir.filePath(QStringLiteral("copy-source.mp4"));
+    QProcess fixture;
+    fixture.start(ffmpeg::toolPath(QStringLiteral("ffmpeg")), {
+        QStringLiteral("-hide_banner"), QStringLiteral("-loglevel"), QStringLiteral("error"),
+        QStringLiteral("-f"), QStringLiteral("lavfi"), QStringLiteral("-i"),
+        QStringLiteral("testsrc=size=32x32:rate=10:duration=4"),
+        QStringLiteral("-f"), QStringLiteral("lavfi"), QStringLiteral("-i"),
+        QStringLiteral("sine=frequency=440:duration=4"),
+        QStringLiteral("-c:v"), QStringLiteral("libx264"), QStringLiteral("-pix_fmt"),
+        QStringLiteral("yuv420p"), QStringLiteral("-g"), QStringLiteral("20"),
+        QStringLiteral("-keyint_min"), QStringLiteral("20"), QStringLiteral("-sc_threshold"),
+        QStringLiteral("0"), QStringLiteral("-bf"), QStringLiteral("0"),
+        QStringLiteral("-c:a"), QStringLiteral("aac"), QStringLiteral("-y"), source});
+    QVERIFY(fixture.waitForFinished(20000));
+    QCOMPARE(fixture.exitCode(), 0);
+
+    ThumbProvider provider;
+    Backend backend(&provider, new FakeFilePicker);
+    QVERIFY(backend.load(QUrl::fromLocalFile(source)));
+    QVERIFY(backend.streamCopyAvailable());
+    QSignalSpy done(&backend, &Backend::exportDone);
+    QSignalSpy failed(&backend, &Backend::exportFailed);
+    const QString target = m_dir.filePath(QStringLiteral("copied.mp4"));
+    const auto input = ffmpeg::probe(source);
+    backend.exportClip(QUrl::fromLocalFile(target), 1.6, 3.5,
+                       ffmpeg::StreamCopySettings{input.videoStream, input.audioStream});
+    QTRY_VERIFY_WITH_TIMEOUT(done.count() + failed.count() > 0, 20000);
+    QCOMPARE(failed.count(), 0);
+    QCOMPARE(done.count(), 1);
+    const auto output = ffmpeg::probe(target);
+    QVERIFY(output.ok);
+    QCOMPARE(output.videoCodec, QStringLiteral("h264"));
+    QCOMPARE(output.audioCodec, QStringLiteral("aac"));
+    QVERIFY2(output.duration > 1.35 && output.duration < 1.85,
+             qPrintable(QStringLiteral("Unexpected copy duration: %1").arg(output.duration)));
+    waitForBackgroundWork(backend);
+
+    const QString shifted = m_dir.filePath(QStringLiteral("shifted.ts"));
+    QProcess remux;
+    remux.start(ffmpeg::toolPath(QStringLiteral("ffmpeg")), {
+        QStringLiteral("-v"), QStringLiteral("error"), QStringLiteral("-i"), source,
+        QStringLiteral("-c"), QStringLiteral("copy"), QStringLiteral("-f"),
+        QStringLiteral("mpegts"), QStringLiteral("-y"), shifted});
+    QVERIFY(remux.waitForFinished(20000));
+    QCOMPARE(remux.exitCode(), 0);
+    const auto shiftedInfo = ffmpeg::probe(shifted);
+    QVERIFY(shiftedInfo.ok);
+    QVERIFY2(shiftedInfo.containerStartSeconds > 1.0,
+             qPrintable(QStringLiteral("Expected nonzero start_time: %1").arg(shiftedInfo.containerStartSeconds)));
+    QVERIFY(backend.load(QUrl::fromLocalFile(shifted)));
+    QVERIFY(backend.streamCopyAvailable());
+    const QString shiftedTarget = m_dir.filePath(QStringLiteral("shifted-copy.mp4"));
+    backend.exportClip(QUrl::fromLocalFile(shiftedTarget), 1.6, 3.5,
+                       ffmpeg::StreamCopySettings{shiftedInfo.videoStream, shiftedInfo.audioStream});
+    QTRY_COMPARE_WITH_TIMEOUT(done.count() + failed.count(), 2, 20000);
+    QCOMPARE(failed.count(), 0);
+    const auto shiftedOutput = ffmpeg::probe(shiftedTarget);
+    QVERIFY(shiftedOutput.ok);
+    QVERIFY2(shiftedOutput.duration > 1.35 && shiftedOutput.duration < 1.85,
+             qPrintable(QStringLiteral("Unexpected shifted copy duration: %1").arg(shiftedOutput.duration)));
+    waitForBackgroundWork(backend);
+}
+
+void BackendTests::incompatibleStreamCopyIsRejected() {
+    const QString source = m_dir.filePath(QStringLiteral("incompatible.mov"));
+    QProcess fixture;
+    fixture.start(ffmpeg::toolPath(QStringLiteral("ffmpeg")), {
+        QStringLiteral("-v"), QStringLiteral("error"), QStringLiteral("-f"),
+        QStringLiteral("lavfi"), QStringLiteral("-i"),
+        QStringLiteral("testsrc=size=32x32:rate=1:duration=2"),
+        QStringLiteral("-c:v"), QStringLiteral("prores_ks"), QStringLiteral("-y"), source});
+    QVERIFY(fixture.waitForFinished(10000));
+    QCOMPARE(fixture.exitCode(), 0);
+    ThumbProvider provider;
+    Backend backend(&provider, new FakeFilePicker);
+    QVERIFY(backend.load(QUrl::fromLocalFile(source)));
+    QVERIFY(!backend.streamCopyAvailable());
+    QVERIFY(backend.streamCopyReason().contains(QStringLiteral("prores")));
+    QSignalSpy failed(&backend, &Backend::exportFailed);
+    const QString target = m_dir.filePath(QStringLiteral("refused.mp4"));
+    const auto input = ffmpeg::probe(source);
+    backend.exportClip(QUrl::fromLocalFile(target), 0, 1,
+                       ffmpeg::StreamCopySettings{input.videoStream, input.audioStream});
+    QCOMPARE(failed.count(), 1);
+    QVERIFY(!backend.busy());
+    QVERIFY(!QFileInfo::exists(target));
+    backend.exportDialog(0, 1, 1);
+    QCOMPARE(failed.count(), 2);
+    waitForBackgroundWork(backend);
+
+    const QString audioSource = m_dir.filePath(QStringLiteral("incompatible-audio.mov"));
+    QProcess audioFixture;
+    audioFixture.start(ffmpeg::toolPath(QStringLiteral("ffmpeg")), {
+        QStringLiteral("-v"), QStringLiteral("error"), QStringLiteral("-f"),
+        QStringLiteral("lavfi"), QStringLiteral("-i"),
+        QStringLiteral("testsrc=size=32x32:rate=1:duration=2"),
+        QStringLiteral("-f"), QStringLiteral("lavfi"), QStringLiteral("-i"),
+        QStringLiteral("sine=duration=2"), QStringLiteral("-c:v"),
+        QStringLiteral("libx264"), QStringLiteral("-pix_fmt"), QStringLiteral("yuv420p"),
+        QStringLiteral("-c:a"), QStringLiteral("pcm_s16le"), QStringLiteral("-y"),
+        audioSource});
+    QVERIFY(audioFixture.waitForFinished(20000));
+    QCOMPARE(audioFixture.exitCode(), 0);
+    QVERIFY(backend.load(QUrl::fromLocalFile(audioSource)));
+    QVERIFY(!backend.streamCopyAvailable());
+    QVERIFY(backend.streamCopyReason().contains(QStringLiteral("pcm_s16le")));
+    waitForBackgroundWork(backend);
+}
+
+void BackendTests::failedKeyframeProbePreservesDestination() {
+    const QString source = m_dir.filePath(QStringLiteral("probe-failure-source.mp4"));
+    QProcess fixture;
+    fixture.start(ffmpeg::toolPath(QStringLiteral("ffmpeg")), {
+        QStringLiteral("-v"), QStringLiteral("error"), QStringLiteral("-i"), m_videoPath,
+        QStringLiteral("-c:v"), QStringLiteral("libx264"), QStringLiteral("-y"), source});
+    QVERIFY(fixture.waitForFinished(10000));
+    QCOMPARE(fixture.exitCode(), 0);
+    ThumbProvider provider;
+    Backend backend(&provider, new FakeFilePicker);
+    QVERIFY(backend.load(QUrl::fromLocalFile(source)));
+    QVERIFY(backend.streamCopyAvailable());
+    const auto input = ffmpeg::probe(source);
+    const QString target = m_dir.filePath(QStringLiteral("probe-failure-destination.mp4"));
+    QFile existing(target);
+    QVERIFY(existing.open(QIODevice::WriteOnly));
+    QCOMPARE(existing.write("unchanged"), qint64(9));
+    existing.close();
+
+    QTemporaryDir fakePath;
+    QVERIFY(fakePath.isValid());
+    QFile fakeProbe(fakePath.filePath(QStringLiteral("ffprobe")));
+    QVERIFY(fakeProbe.open(QIODevice::WriteOnly));
+    fakeProbe.write("#!/bin/sh\nexit 1\n");
+    fakeProbe.close();
+    QVERIFY(fakeProbe.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner
+                                     | QFileDevice::ExeOwner));
+    EnvVarGuard guard("PATH");
+    qputenv("PATH", QFile::encodeName(fakePath.path()) + ':' + qgetenv("PATH"));
+    QSignalSpy failed(&backend, &Backend::exportFailed);
+    QSignalSpy done(&backend, &Backend::exportDone);
+    backend.exportClip(QUrl::fromLocalFile(target), 0.1, 0.8,
+                       ffmpeg::StreamCopySettings{input.videoStream, input.audioStream});
+    QTRY_COMPARE_WITH_TIMEOUT(failed.count(), 1, 10000);
+    QCOMPARE(done.count(), 0);
+    QVERIFY(!backend.busy());
+    QVERIFY(existing.open(QIODevice::ReadOnly));
+    QCOMPARE(existing.readAll(), QByteArray("unchanged"));
+    QVERIFY(!QFileInfo::exists(target + QStringLiteral(".omacut-part.mp4")));
+    waitForBackgroundWork(backend);
+}
+
+void BackendTests::qmlDisablesIncompatibleStreamCopy() {
+    ShortcutBackend backend(QUrl::fromLocalFile(QStringLiteral("/tmp/clip.mp4")), 10);
+    QmlHarness harness(backend);
+    auto *window = harness.window();
+    QVERIFY(window);
+    QQuickItem *copy = window->findChild<QQuickItem *>(QStringLiteral("streamCopyMode"));
+    QVERIFY(copy);
+    QQuickItem *reason = window->findChild<QQuickItem *>(QStringLiteral("streamCopyExplanation"));
+    QVERIFY(reason);
+    QVERIFY(!copy->isEnabled());
+    QVERIFY(reason->property("text").toString().contains(QStringLiteral("H.264")));
+    window->show();
+    window->requestActivate();
+    QTest::qWait(100);
+    backend.setCopyAvailable(true);
+    QTRY_VERIFY(copy->isEnabled());
+    QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier, itemCenter(copy));
+    QTRY_VERIFY(copy->property("checked").toBool());
+    QTest::keyClick(window, Qt::Key_S, Qt::ControlModifier);
+    QTRY_COMPARE(backend.exportCount, 1);
+    QCOMPARE(backend.lastMode, 1);
+    backend.setCopyAvailable(false);
+    QTRY_VERIFY(!copy->isEnabled());
+    QVERIFY(!copy->property("checked").toBool());
 }
 
 void BackendTests::exportClipCanReplaceSourceFile() {
@@ -877,7 +1132,7 @@ void BackendTests::trimArgsScaleTheShorterSide() {
     // The filter caps whichever side is shorter, keeping the aspect ratio for
     // portrait and landscape alike.
     const QStringList args = ffmpeg::trimArgs(QStringLiteral("in.mp4"), QStringLiteral("out.mp4"),
-                                              0.0, 1.0, 1080);
+                                              0.0, 1.0, ffmpeg::EncodeSettings{1080});
     const int vfAt = args.indexOf(QStringLiteral("-vf"));
     QVERIFY(vfAt >= 0);
     QCOMPARE(args.value(vfAt + 1),

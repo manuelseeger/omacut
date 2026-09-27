@@ -53,7 +53,8 @@ ApplicationWindow {
             return;
         pendingExportStartSec = trimBar.startSec;
         pendingExportEndSec = trimBar.endSec;
-        backend.exportDialog(trimBar.startSec, trimBar.endSec);
+        backend.exportDialog(trimBar.startSec, trimBar.endSec,
+                             streamCopyButton.checked ? 1 : 0);
     }
     function ensureAudioOutput() {
         if (audioOutput === null && win.hasVideo)
@@ -515,6 +516,39 @@ ApplicationWindow {
             }
         }
 
+        ButtonGroup { id: exportModeGroup }
+        RowLayout {
+            visible: win.hasVideo
+            Layout.fillWidth: true
+            spacing: 12
+
+            RadioButton {
+                id: encodeButton
+                ButtonGroup.group: exportModeGroup
+                objectName: "encodeMode"
+                text: "Encode"
+                checked: true
+                enabled: !backend.busy
+            }
+            RadioButton {
+                id: streamCopyButton
+                ButtonGroup.group: exportModeGroup
+                objectName: "streamCopyMode"
+                text: "Stream Copy"
+                enabled: backend.streamCopyAvailable && !backend.busy
+            }
+            Label {
+                objectName: "streamCopyExplanation"
+                Layout.fillWidth: true
+                text: backend.streamCopyAvailable
+                    ? "Stream Copy starts at the nearest keyframe. No re-encoding or resizing."
+                    : backend.streamCopyReason
+                color: backend.streamCopyAvailable ? "#b8b8bc" : "#88888e"
+                font.pixelSize: 12
+                wrapMode: Text.Wrap
+            }
+        }
+
         // --- timeline ---
         RowLayout {
             visible: win.hasVideo
@@ -777,6 +811,8 @@ ApplicationWindow {
             trimBar.playheadSec = 0;
             win.exportedStartSec = -1;
             win.exportedEndSec = -1;
+            if (!backend.streamCopyAvailable)
+                encodeButton.checked = true;
         }
         function onExportDone(path) {
             win.exportedStartSec = win.pendingExportStartSec;
