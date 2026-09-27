@@ -29,7 +29,9 @@ Install via the Omarchy Package Repository via the `omacut` package. It's instal
 - `xdg-desktop-portal` and a portal backend for the file picker
 - `ffmpeg` and `ffprobe` on your PATH (used at runtime)
 
-Exports are always written as MP4 files, regardless of the input video's container. The export dialog offers Original/1080p/720p quality — never upscaling, and always preserving the aspect ratio.
+Exports use MP4 even when the source has a different container. Choose Encode for frame-accurate cuts. The save dialog offers Original, 1080p, and 720p sizes when the source is large enough. These sizes preserve the aspect ratio and never upscale.
+
+Choose Stream Copy to keep the video and audio codecs without re-encoding or resizing. Stream Copy supports H.264, HEVC, MPEG-4, or AV1 video with AAC, MP3, AC-3, E-AC-3, ALAC, or no audio. The clip starts at the nearest keyframe before the selected end. The end stays at the selected time. The mode selector shows why Stream Copy is unavailable for other sources.
 
 ## Build
 

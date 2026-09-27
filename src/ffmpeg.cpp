@@ -5,6 +5,7 @@
 #include <QJsonObject>
 #include <QProcess>
 #include <QStandardPaths>
+#include <cmath>
 
 namespace ffmpeg {
 
@@ -36,7 +37,6 @@ VideoInfo probe(const QString &path) {
         "-print_format", "json",
         "-show_format",
         "-show_streams",
-        "-select_streams", "v:0",
         path,
     });
     if (!proc.waitForFinished(kProbeTimeoutMs)) {
@@ -56,12 +56,34 @@ VideoInfo probe(const QString &path) {
     const QJsonDocument doc = QJsonDocument::fromJson(proc.readAllStandardOutput());
     const QJsonObject root = doc.object();
     const QJsonArray streams = root.value("streams").toArray();
-    if (streams.isEmpty()) {
+    QJsonObject stream;
+    for (const QJsonValue &value : streams) {
+        const QJsonObject candidate = value.toObject();
+        const QString type = candidate.value("codec_type").toString();
+        if (type == QStringLiteral("video") && info.videoStream < 0) {
+            info.videoStream = candidate.value("index").toInt(-1);
+            info.videoCodec = candidate.value("codec_name").toString();
+            stream = candidate;
+        } else if (type == QStringLiteral("audio") && info.audioStream < 0) {
+            info.audioStream = candidate.value("index").toInt(-1);
+            info.audioCodec = candidate.value("codec_name").toString();
+        }
+    }
+    if (info.videoStream < 0) {
         info.error = "No video stream found in this file.";
         return info;
     }
-
-    const QJsonObject stream = streams.first().toObject();
+    const QStringList mp4Video = {QStringLiteral("h264"), QStringLiteral("hevc"),
+                                  QStringLiteral("mpeg4"), QStringLiteral("av1")};
+    const QStringList mp4Audio = {QStringLiteral("aac"), QStringLiteral("mp3"),
+                                  QStringLiteral("ac3"), QStringLiteral("eac3"),
+                                  QStringLiteral("alac")};
+    if (!mp4Video.contains(info.videoCodec))
+        info.copyUnavailableReason = QStringLiteral("MP4 cannot copy the %1 video stream.")
+                                         .arg(info.videoCodec.isEmpty() ? QStringLiteral("unknown") : info.videoCodec);
+    else if (info.audioStream >= 0 && !mp4Audio.contains(info.audioCodec))
+        info.copyUnavailableReason = QStringLiteral("MP4 cannot copy the %1 audio stream.")
+                                         .arg(info.audioCodec.isEmpty() ? QStringLiteral("unknown") : info.audioCodec);
 
     info.width = stream.value("width").toInt();
     info.height = stream.value("height").toInt();
@@ -76,6 +98,11 @@ VideoInfo probe(const QString &path) {
     }
 
     info.duration = durationStr.toDouble();
+    bool validStart = false;
+    const double startTime = root.value("format").toObject().value("start_time")
+                                 .toString().toDouble(&validStart);
+    if (validStart && std::isfinite(startTime))
+        info.containerStartSeconds = startTime;
 
     info.ok = info.duration > 0.0;
     if (!info.ok)
@@ -123,27 +150,48 @@ QImage thumbnail(const QString &path, double time, int height,
     return img;
 }
 
+bool nearestKeyframe(const QByteArray &line, double start, double end,
+                     double startTime, double *resolved) {
+    const QList<QByteArray> fields = line.trimmed().split(',');
+    if (fields.size() >= 2 && fields.at(1).contains('K')) {
+        bool valid = false;
+        const double time = fields.at(0).toDouble(&valid) - startTime;
+        if (valid && std::isfinite(time) && time >= 0 && time < end
+            && (*resolved < 0 || std::abs(time - start) < std::abs(*resolved - start)
+                || (std::abs(time - start) == std::abs(*resolved - start) && time < *resolved)))
+            *resolved = time;
+    }
+    return *resolved >= 0;
+}
+
 QStringList trimArgs(const QString &src, const QString &dst, double start, double end,
-                     int scaleHeight) {
-    // Machine-readable progress on stdout (errors stay on stderr), so the UI
-    // can show how far along the encode is.
+                     const ExportSettings &settings) {
     QStringList args = {"-y", "-loglevel", "error", "-progress", "pipe:1"};
+    const bool copy = std::holds_alternative<StreamCopySettings>(settings);
     // -ss before -i seeks fast; -t gives the output duration. +faststart puts
     // the moov atom up front so shared clips start playing before they finish
     // downloading.
-    args << "-ss" << QString::number(start, 'f', 3)
+    args << "-ss" << QString::number(start, 'f', copy ? 6 : 3)
          << "-i" << src
-         << "-t" << QString::number(qMax(end - start, 0.0), 'f', 3);
+         << "-t" << QString::number(qMax(end - start, 0.0), 'f', copy ? 6 : 3);
     // Cap the shorter side, judged on the decoded (rotation-applied) frame, so
     // portrait and landscape both keep their aspect ratio. -2 keeps the other
     // side divisible by two, which libx264 requires.
-    if (scaleHeight > 0)
-        args << "-vf"
-             << QString("scale='if(gt(iw,ih),-2,%1)':'if(gt(iw,ih),%1,-2)'").arg(scaleHeight);
-    args << "-c:v" << "libx264" << "-preset" << "veryfast"
-         << "-crf" << "18" << "-c:a" << "aac"
-         << "-movflags" << "+faststart"
-         << dst;
+    if (copy) {
+        const auto streams = std::get<StreamCopySettings>(settings);
+        args << "-map" << QStringLiteral("0:%1").arg(streams.videoStream);
+        if (streams.audioStream >= 0)
+            args << "-map" << QStringLiteral("0:%1").arg(streams.audioStream);
+        args << "-c" << "copy" << "-avoid_negative_ts" << "make_zero";
+    } else {
+        const int scaleHeight = std::get<EncodeSettings>(settings).scaleHeight;
+        if (scaleHeight > 0)
+            args << "-vf"
+                 << QString("scale='if(gt(iw,ih),-2,%1)':'if(gt(iw,ih),%1,-2)'").arg(scaleHeight);
+        args << "-c:v" << "libx264" << "-preset" << "veryfast"
+             << "-crf" << "18" << "-c:a" << "aac";
+    }
+    args << "-movflags" << "+faststart" << dst;
     return args;
 }
 
